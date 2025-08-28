@@ -1,0 +1,498 @@
+df1 <- read_xlsx(path = paste(data, 'bhp012_env_summary_2016MAR06v1.xlsx', sep=''),
+                 sheet = 'bhp012_gag_env_summary_23Feb16')
+df2 <- read_xls(path = paste(data, 'bhp012_gag_env_summary_24Feb2016_vl_smm.xls', sep=''))
+df2$id <- paste0(df2$id, "2")
+
+df1_selection <- df1[df1$asis_or_modified=='asis',]
+df1_selection <- df1_selection[, c('id', 'days_ps', 'gag_mean_TN93',
+                                   'env_mean_TN93',
+                                   'single_multiple_lineage', 'art',
+                                   'art_start_days')]
+df2_selection <- df2[df2$asis_or_modified=='asis',]
+df2_selection <- df2_selection[, c('id', 'days_ps', 'gag_mean_TN93',
+                                   'env_mean_TN93',
+                                   'single_multiple_lineage', 'art',
+                                   'art_start_days')]
+
+
+df <- rbind(df1_selection, df2_selection)
+df$M <- ifelse(df$single_multiple_lineage=='multiple', 1, 0)
+df <- df[!is.na(df$M), ]
+
+df <- df %>%
+  fill(art_start_days, .direction = "down")
+
+df$TSI_corr <- ifelse(df$art == 1,
+                      df$art_start_days,
+                      df$days_ps)
+
+df_DNA <- df[!is.na(df$gag_mean_TN93),]
+df_DNA <- df_DNA[!is.na(df_DNA$env_mean_TN93),]
+
+df_DNA <- df_DNA[df_DNA$gag_mean_TN93 < 0.01, ]
+df_DNA <- df_DNA[df_DNA$env_mean_TN93 < 0.02, ]
+
+df_DNA$gag_scale <- as.numeric(scale(df_DNA$gag_mean_TN93))
+df_DNA$env_scale <- as.numeric(scale(df_DNA$env_mean_TN93))
+df_DNA$TSI_scale <- as.numeric(scale(df_DNA$days_ps))
+
+id <- unique(df_DNA$id)
+set.seed(123)
+shuffled_id <- sample(id)
+test_id <- shuffled_id[1:15]
+train_id <- shuffled_id[16:length(shuffled_id)]
+df_DNA_train <- df_DNA %>% filter(id %in% train_id)
+df_DNA_test  <- df_DNA %>% filter(id %in% test_id)
+df_DNA_test <- df_DNA_test %>%
+  mutate(id_id = as.integer(as.factor(id)))
+df_DNA_train <- df_DNA_train %>%
+  mutate(id_id = as.integer(as.factor(id)))
+
+DNA1_txt <- "
+data {
+  int<lower=1> N; // number of observation
+  vector[N] time;
+  vector[N] M; // binary: 1 iff multiple
+  vector[N] gag;
+  vector[N] env;
+  int<lower=1> N_tilde; // number of observation
+  vector[N_tilde] time_tilde;
+  vector[N_tilde] M_tilde; // binary: 1 iff multiple
+  vector[N_tilde] gag_tilde;
+  vector[N_tilde] env_tilde;
+}
+
+parameters{
+  real alpha;
+  real beta_M;
+  real beta_gag;
+  real beta_env;
+  real<lower=0> sigma;
+}
+
+transformed parameters {
+  vector[N] mu;
+  
+  mu = alpha + beta_M * M + beta_gag * gag + beta_env * env;
+}
+
+model{
+  // Priors
+  alpha ~ normal(0, 1);
+  beta_M ~ normal(0, 1);
+  beta_gag ~ normal(0, 1);
+  beta_env ~ normal(0, 1);
+  sigma ~ exponential(1);
+  // Model
+  time ~ normal(mu, sigma);
+}
+
+generated quantities {
+  array[N_tilde] real timepred;
+  vector[N_tilde] log_lik;
+  vector[N_tilde] mu_tilde;
+
+  mu_tilde = alpha +
+    beta_M * M_tilde + beta_gag * gag_tilde + beta_env * env_tilde;
+  
+  timepred = normal_rng(mu_tilde, sigma);
+  
+  for (n in 1:N_tilde){
+    log_lik[n] = normal_lpdf(time_tilde[n] | mu_tilde[n], sigma);
+  }
+}
+"
+
+# compile the model
+DNA1_filename <- cmdstanr::write_stan_file(
+  gsub('\t',' ', DNA1_txt ),
+  dir = out,
+  basename = NULL,
+  force_overwrite = FALSE,
+  hash_salt = ""
+)
+
+# compile Stan model
+DNA1_compiled <- cmdstanr::cmdstan_model(DNA1_filename)
+
+stan_data <- list(
+  N = nrow(df_DNA_train),
+  time = df_DNA_train$TSI_scale,
+  M = df_DNA_train$M,
+  gag = df_DNA_train$gag_scale,
+  env = df_DNA_train$env_scale,
+  N_tilde = nrow(df_DNA_test),
+  time_tilde = df_DNA_test$TSI_scale,
+  M_tilde = df_DNA_test$M,
+  gag_tilde = df_DNA_test$gag_scale,
+  env_tilde = df_DNA_test$env_scale
+)
+
+
+# sample
+DNA1_fit <- DNA1_compiled$sample(
+  data = stan_data,
+  seed = 6373,
+  chains = 4,
+  parallel_chains = 4,
+  iter_warmup = 1000,
+  iter_sampling = 2000,
+  refresh = 500,
+  adapt_delta = 0.95
+)
+
+# Check the model
+tmp <- DNA1_fit$summary(
+  variables = c('alpha', 'beta_M','beta_gag', 'beta_env', 'sigma'),
+  posterior::default_summary_measures(),
+  posterior::default_convergence_measures()
+)
+
+print("Maximum of rhat: ")
+max(tmp$rhat) # = 1.001 < 1.01
+print("Minimum of ess_bulk: ")
+min(tmp$ess_bulk) # = 5000
+print("Minimum of ess_tail: ")
+min(tmp$ess_tail) # = 5100
+
+
+# parameter with lowest ess_bulk
+DNA1_worst_var <- tmp$variable[which.min(tmp$ess_bulk)]
+
+# extract samples
+DNA1_po <- DNA1_fit$draws(
+  variables = c("lp__",DNA1_worst_var),
+  inc_warmup = FALSE,
+  format = "draws_array"
+)
+
+# make trace plot
+p <- bayesplot:::mcmc_trace(DNA1_po,  
+                            pars = c("lp__",DNA1_worst_var),
+                            facet_args = list(nrow = 2)
+)
+p <- p + theme_bw()
+ggsave(file = file.path(out,'HM_DNA1_trace_worst_var.png'), 
+       plot = p, 
+       h = 10, 
+       w = 8
+)
+
+p
+
+
+# pairwise posterior check
+# extract samples
+DNA1_po <- DNA1_fit$draws(
+  variables = c('alpha', 'beta_M','beta_gag', 'beta_env', 'sigma'),
+  inc_warmup = FALSE,
+  format = "draws_array"
+)
+
+bayesplot::color_scheme_set('viridisC')
+p <- bayesplot::mcmc_pairs(DNA1_po, 
+                           pars = c('alpha', 'beta_M','beta_gag',
+                                    'beta_env', 'sigma'),
+                           diag_fun = "dens", 
+                           off_diag_fun = "hex"
+) 
+ggsave(file = file.path(out,'HM_DNA1_pairsplot.png'), 
+       plot = p, 
+       h = 15, 
+       w = 15, 
+       limitsize = FALSE
+)
+bayesplot::color_scheme_set('brewer-RdYlBu')
+
+p
+
+# Posterior predictive check
+po <- DNA1_fit$draws(variables = "timepred", 
+                     inc_warmup = FALSE,
+                     format = "draws_df"
+)
+po <- as.data.table(po)
+po <- data.table::melt(po, 
+                       id.vars = c('.chain','.iteration','.draw')
+)
+set(po, NULL, 'OBS_ID', gsub('timepred\\[([0-9]+)\\]','\\1',as.character(po$variable)))
+set(po, NULL, 'OBS_ID', as.integer(po$OBS_ID))
+setnames(po, c('value'), c('post_pred'))
+set(po, NULL, 'variable', NULL)
+
+# create median and 95\% credible intervals
+pos_1 <- 
+  po[,
+     list( summary_value = quantile(post_pred, prob = c(0.025, 0.16, 0.5, 0.84, 0.975)),
+           summary_name = c('q_lower','iqr_lower','median','iqr_upper','q_upper') 
+     ),
+     by = 'OBS_ID'
+  ]
+pos_1 <- 
+  data.table::dcast(pos_1,
+                    OBS_ID ~ summary_name, 
+                    value.var = 'summary_value'
+  )
+
+df_DNA_test$OBS_ID <- seq_len(nrow(df_DNA_test))
+
+pos <- merge(df_DNA_test, pos_1, by="OBS_ID")
+pos <- as.data.table(pos)
+pos[, IN_PPI95 := TSI_scale >= q_lower & TSI_scale <= q_upper]
+pos[, IN_PPI68 := TSI_scale >= iqr_lower & TSI_scale <= iqr_upper]
+
+# Print 
+print('The number of values outside the prediction (with 32% margin) are:')
+pos[IN_PPI68 == FALSE, .N]
+print('The number of values outside the prediction (with 5% margin) are:')
+pos[IN_PPI95 == FALSE, .N]
+
+ggplot(pos, aes(x = 221 + 170 * TSI_scale, y = 221 + 170 * median)) +
+  geom_point() +
+  #geom_errorbar(aes(ymin = q_lower, ymax = q_upper), width = 0.02) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "gray40") +
+  labs(
+    x = "True TSI",
+    y = "Estimated TSI\n(without confidence intervals)"
+  ) +
+  theme_minimal()
+
+# ELPD
+log_lik_matrix <- DNA1_fit$draws("log_lik",
+                                 format = "draws_matrix")[,1:69]
+loo_result <- loo(log_lik_matrix)
+print(loo_result)
+
+
+
+
+yrep <- as.matrix(DNA1_fit$draws(variables = "timepred",
+                                 format = "draws_matrix"))
+
+y <- df_DNA_test$sqrt_TSI_corr_scaled
+var_yrep <- apply(yrep, 1, var)
+residuals <- sweep(yrep, 2, y)
+var_resid <- apply(residuals^2, 1, mean)
+r2_bayes <- var_yrep / (var_yrep + var_resid)
+mean_r2 <- mean(r2_bayes)
+ci_r2 <- quantile(r2_bayes, probs = c(0.05, 0.5, 0.95))
+mean_r2
+ci_r2
+rmse <- sqrt(mean((y - yrep)^2))
+rmse
+
+
+###################
+
+# compile the model
+NGS1_filename <- cmdstanr::write_stan_file(
+  gsub('\t',' ', DNA1_txt ),
+  dir = out,
+  basename = NULL,
+  force_overwrite = FALSE,
+  hash_salt = ""
+)
+
+# compile Stan model
+NGS1_compiled <- cmdstanr::cmdstan_model(NGS1_filename)
+
+NGS_data_train$sqrt_TSI <- sqrt(NGS_data_train$TSI_corr)
+NGS_data_test$sqrt_TSI <- sqrt(NGS_data_test$TSI_corr)
+NGS_data_train$sqrt_TSI_scaled <- as.numeric(scale(NGS_data_train$sqrt_TSI))
+NGS_data_test$sqrt_TSI_scaled <- as.numeric(scale(NGS_data_test$sqrt_TSI))
+
+
+stan_data <- list(
+  N = nrow(NGS_data_train),
+  time = NGS_data_train$TSI_corr_scaled,
+  M = NGS_data_train$M,
+  gag = NGS_data_train$gag_scaled,
+  env = NGS_data_train$env_scaled,
+  N_tilde = nrow(NGS_data_test),
+  time_tilde = NGS_data_test$TSI_corr_scaled,
+  M_tilde = NGS_data_test$M,
+  gag_tilde = NGS_data_test$gag_scaled,
+  env_tilde = NGS_data_test$env_scaled
+)
+
+
+# sample
+NGS1_fit <- NGS1_compiled$sample(
+  data = stan_data,
+  seed = 6373,
+  chains = 4,
+  parallel_chains = 4,
+  iter_warmup = 500,
+  iter_sampling = 8000,
+  refresh = 500,
+  adapt_delta = 0.95
+)
+
+# Check the model
+tmp <- NGS1_fit$summary(
+  variables = c('alpha', 'beta_M','beta_gag', 'beta_env', 'sigma'),
+  posterior::default_summary_measures(),
+  posterior::default_convergence_measures()
+)
+
+print("Maximum of rhat: ")
+max(tmp$rhat) # = 1.001 < 1.01
+print("Minimum of ess_bulk: ")
+min(tmp$ess_bulk) # = 5000
+print("Minimum of ess_tail: ")
+min(tmp$ess_tail) # = 5100
+
+
+# parameter with lowest ess_bulk
+NGS1_worst_var <- tmp$variable[which.min(tmp$ess_bulk)]
+
+# extract samples
+NGS1_po <- NGS1_fit$draws(
+  variables = c("lp__",NGS1_worst_var),
+  inc_warmup = FALSE,
+  format = "draws_array"
+)
+
+# make trace plot
+p <- bayesplot:::mcmc_trace(NGS1_po,  
+                            pars = c("lp__",NGS1_worst_var),
+                            facet_args = list(nrow = 2)
+)
+p <- p + theme_bw()
+ggsave(file = file.path(out,'HM_NGS1_trace_worst_var.png'), 
+       plot = p, 
+       h = 10, 
+       w = 8
+)
+
+p
+
+
+# pairwise posterior check
+# extract samples
+NGS1_po <- NGS1_fit$draws(
+  variables = c('alpha', 'beta_M','beta_gag', 'beta_env', 'sigma'),
+  inc_warmup = FALSE,
+  format = "draws_array"
+)
+
+bayesplot::color_scheme_set('viridisC')
+p <- bayesplot::mcmc_pairs(NGS1_po, 
+                           pars = c('alpha', 'beta_M','beta_gag',
+                                    'beta_env', 'sigma'),
+                           diag_fun = "dens", 
+                           off_diag_fun = "hex"
+) 
+ggsave(file = file.path(out,'HM_NGS1_pairsplot.png'), 
+       plot = p, 
+       h = 15, 
+       w = 15, 
+       limitsize = FALSE
+)
+bayesplot::color_scheme_set('brewer-RdYlBu')
+
+p
+
+# Posterior predictive check
+po <- NGS1_fit$draws(variables = "timepred", 
+                     inc_warmup = FALSE,
+                     format = "draws_df"
+)
+po <- as.data.table(po)
+po <- data.table::melt(po, 
+                       id.vars = c('.chain','.iteration','.draw')
+)
+set(po, NULL, 'OBS_ID', gsub('timepred\\[([0-9]+)\\]','\\1',as.character(po$variable)))
+set(po, NULL, 'OBS_ID', as.integer(po$OBS_ID))
+setnames(po, c('value'), c('post_pred'))
+set(po, NULL, 'variable', NULL)
+
+# create median and 95\% credible intervals
+pos_1 <- 
+  po[,
+     list( summary_value = quantile(post_pred, prob = c(0.025, 0.16, 0.5, 0.84, 0.975)),
+           summary_name = c('q_lower','iqr_lower','median','iqr_upper','q_upper') 
+     ),
+     by = 'OBS_ID'
+  ]
+pos_1 <- 
+  data.table::dcast(pos_1,
+                    OBS_ID ~ summary_name, 
+                    value.var = 'summary_value'
+  )
+
+NGS_data$OBS_ID <- seq_len(nrow(NGS_data))
+
+pos <- merge(NGS_data, pos_1, by="OBS_ID")
+pos <- as.data.table(pos)
+pos[, IN_PPI95 := TSI_corr_scaled >= q_lower & TSI_corr_scaled <= q_upper]
+pos[, IN_PPI68 := TSI_corr_scaled >= iqr_lower & TSI_corr_scaled <= iqr_upper]
+
+# Print 
+print('The number of values outside the prediction (with 32% margin) are:')
+pos[IN_PPI68 == FALSE, .N]
+print('The number of values outside the prediction (with 5% margin) are:')
+pos[IN_PPI95 == FALSE, .N]
+
+pos <- pos[order(pos$TSI_scaled), ]
+
+ggplot(pos, aes(x = sqrt_TSI_scaled, y = median)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = q_lower, ymax = q_upper), width = 0.02) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "gray40") +
+  labs(
+    x = "True Time Since Infection",
+    y = "Estimation from the model
+    (with 95% error margin)"
+  ) +
+  theme_minimal()
+
+# ELPD
+log_lik_matrix <- NGS1_fit$draws("log_lik",
+                                 format = "draws_matrix")[,1:69]
+loo_result <- loo(log_lik_matrix)
+print(loo_result)
+
+
+
+
+yrep <- as.matrix(NGS1_fit$draws(variables = "timepred",
+                                 format = "draws_matrix"))
+
+y <- NGS_data_test$TSI_corr_scaled
+var_yrep <- apply(yrep, 1, var)
+residuals <- sweep(yrep, 2, y)
+var_resid <- apply(residuals^2, 1, mean)
+r2_bayes <- var_yrep / (var_yrep + var_resid)
+mean_r2 <- mean(r2_bayes)
+ci_r2 <- quantile(r2_bayes, probs = c(0.05, 0.5, 0.95))
+mean_r2
+ci_r2
+rmse <- sqrt(mean((y - yrep)^2))
+rmse
+
+tmp <- DNA1_fit$summary(
+  variables = c('alpha', 'beta_M','beta_gag', 'beta_env', 'sigma'),
+  posterior::default_summary_measures(),
+  posterior::default_convergence_measures()
+)
+
+tmp
+betas <- tmp$mean[1:4]
+betas <- c(163, 6807, 8129, -131)
+
+X_df <- df_DNA_train[, c('M', 'gag_mean_TN93', 'env_mean_TN93')]
+predictions <- apply(X_df, 1, function(row) prediction(row, betas))
+
+df_DNA_train$predictions <- predictions
+
+ggplot(df_DNA_test, aes(x = gag_mean_TN93, y = days_ps, colour = M)) +
+  geom_point() +
+  labs(
+    x = "gag/env",
+    y = "TSI"
+  ) +
+  theme_minimal()
+
